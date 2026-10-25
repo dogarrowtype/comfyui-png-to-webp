@@ -1,5 +1,7 @@
 # comfyui-png-to-webp
 
+Have a large comfyui backlog? Need to turn those PNGs into WEBPs to save space, while keeping the workflow? Use this.
+
 Batch-convert ComfyUI PNG generations to lossy WebP (quality 100, slowest
 encoder) for archiving, dumping each image's embedded ComfyUI **workflow** to
 a sidecar `.json` file. Built for very large folders: it encodes in parallel
