@@ -1,0 +1,438 @@
+#!/usr/bin/env bash
+#
+# comfyui-png-to-webp - Batch-convert ComfyUI PNG generations to lossy WebP
+# (quality 100, slowest encoder) with the embedded workflow dumped to a
+# sidecar .json file.
+#
+# For each <name>.png in the target directory:
+#   1. Extract the ComfyUI "Workflow" tEXt chunk -> <name>.json (verbatim)
+#   2. Encode -> <name>.webp  (cwebp -q 100 -m 6, i.e. lossy q100 + slowest)
+#   3. Verify the .webp decodes, then delete the source .png (unless --keep)
+#
+# Safe to re-run: files that already have both outputs are skipped, and all
+# outputs are written via temp files then renamed, so an interrupted run
+# never leaves a half-written .webp/.json and never loses a source .png.
+#
+# DEPENDENCIES / BOOTSTRAP
+#   If exiftool and/or cwebp are not found on PATH, they are downloaded
+#   automatically (once) into ./tools next to this script, with SHA-256
+#   checksum verification:
+#     - cwebp/webpinfo: official prebuilt static libwebp binaries from
+#       downloads.webmproject.org (linux-x86-64, linux-aarch64, mac-x86-64,
+#       mac-arm64). The tools/ layout is per-platform, so the same folder
+#       can be shared across machines/OSes.
+#     - exiftool: tag archive from exiftool.org / GitHub, run via the
+#       system perl (present on essentially every Linux and macOS).
+#   Only remaining prerequisite: bash, perl, curl or wget, tar.
+#   Disable downloads with --no-bootstrap or relocate with CPTW_TOOLS_DIR.
+#
+# Works on Linux and macOS (bash 3.2+, BSD userland compatible).
+
+set -u
+set -o pipefail
+
+PROG="$(basename "$0")"
+SCRIPT_DIR="$(CDPATH= cd "$(dirname "$0")" && pwd -P)"
+TOOLS_DIR="${CPTW_TOOLS_DIR:-$SCRIPT_DIR/tools}"
+
+# Pinned dependency versions and SHA-256 checksums.
+WEBP_VERSION="1.6.0"
+WEBP_BASE_URL="https://storage.googleapis.com/downloads.webmproject.org/releases/webp"
+EXIFTOOL_VERSION="13.59"
+EXIFTOOL_ORG_SHA="668ea3acececb7235fbd0f4900e72d5f12c9b07e5c778fd36cb1e9b5828fd65a"
+EXIFTOOL_GH_SHA="87d3317882fdae9cb4dcfe57a96a378d0132ffc02c731315bf128b19ddcf7aac"
+
+usage() {
+    cat <<EOF
+Usage: $PROG [OPTIONS] [DIRECTORY]
+
+Batch-convert ComfyUI PNG generations to lossy WebP (q100, slowest encoder)
+plus a sidecar .json containing the embedded workflow.
+
+Arguments:
+  DIRECTORY           Folder with PNG files (default: current directory).
+                        Non-recursive; process subfolders individually.
+
+Options:
+  -j, --jobs N        Parallel encoders (default: all CPU cores).
+  -k, --keep          Keep source PNGs after successful conversion.
+  -q, --quality N     WebP quality 0-100 (default: 100).
+  -m, --method N      cwebp effort 0-6 (default: 6 = slowest).
+  -n, --dry-run       Print what would be done, change nothing.
+      --no-bootstrap  Fail instead of downloading missing tools.
+  -h, --help          Show this help.
+
+Dependencies:
+  exiftool and cwebp are downloaded automatically into '$TOOLS_DIR'
+  on first run if not found on PATH (checksum-verified; static libwebp
+  binaries; exiftool runs on system perl). Override the location with the
+  CPTW_TOOLS_DIR environment variable.
+
+Exit status: 0 if every file succeeded or was skipped, 1 otherwise.
+EOF
+}
+
+log() { printf '%s\n' "$*"; }
+err() { printf '%s\n' "$*" >&2; }
+die() { err "$PROG: $*"; exit 2; }
+
+# ---------------------------------------------------------------------------
+# Download / checksum helpers
+# ---------------------------------------------------------------------------
+
+fetch() {
+    # $1 = url, $2 = dest file
+    if command -v curl >/dev/null 2>&1; then
+        curl -fSL --retry 2 --connect-timeout 15 -o "$2" "$1"
+    elif command -v wget >/dev/null 2>&1; then
+        wget -q -O "$2" "$1"
+    else
+        return 1
+    fi
+}
+
+sha256_of() {
+    if command -v shasum >/dev/null 2>&1; then
+        shasum -a 256 "$1" | awk '{print $1}'
+    elif command -v sha256sum >/dev/null 2>&1; then
+        sha256sum "$1" | awk '{print $1}'
+    elif command -v openssl >/dev/null 2>&1; then
+        openssl dgst -sha256 "$1" | awk '{print $NF}'
+    else
+        return 1
+    fi
+}
+
+# $1 = url, $2 = expected sha256, $3 = dest file; 0 iff downloaded AND verified
+download_verified() {
+    fetch "$1" "$3" 2>/dev/null || return 1
+    [ "$(sha256_of "$3")" = "$2" ]
+}
+
+platform_pkg_suffix() {
+    local s m
+    s="$(uname -s)"; m="$(uname -m)"
+    case "$s" in
+        Linux)
+            case "$m" in
+                x86_64|amd64)   echo linux-x86-64 ;;
+                aarch64|arm64)  echo linux-aarch64 ;;
+                *) return 1 ;;
+            esac ;;
+        Darwin)
+            case "$m" in
+                x86_64) echo mac-x86-64 ;;
+                arm64)  echo mac-arm64 ;;
+                *) return 1 ;;
+            esac ;;
+        *) return 1 ;;
+    esac
+}
+
+webp_sha() {
+    case "$1" in
+        linux-x86-64)  echo 1c5ffab71efecefa0e3c23516c3a3a1dccb45cc310ae1095c6f14ae268e38067 ;;
+        linux-aarch64) echo 69f5eebe203e0f3942fe37986209a1725741be19c152950a4283b376c95ec798 ;;
+        mac-x86-64)    echo f112dd83b420ab2a4b27d46610d9827ddf4200216023281de378647ecca31c2a ;;
+        mac-arm64)     echo bc6bf84cc70f3f8574fba797d1e4a7dea4feebe9fa4be919f202413ea2b3b8f2 ;;
+    esac
+}
+
+# ---------------------------------------------------------------------------
+# Bootstrap: download tools into $TOOLS_DIR (checksum-verified, mkdir-locked)
+# ---------------------------------------------------------------------------
+
+bootstrap_webp() {
+    local plat pkg url sha tmp
+    plat="$(platform_pkg_suffix)" || die "unsupported platform '$(uname -s)-$(uname -m)' for auto-download; install webp tools via your package manager (e.g. apt/dnf install webp, brew install webp)"
+    sha="$(webp_sha "$plat")"
+    [ -n "$sha" ] || die "no pinned checksum for platform $plat; install webp tools manually"
+    pkg="libwebp-$WEBP_VERSION-$plat"
+    url="$WEBP_BASE_URL/$pkg.tar.gz"
+    tmp="$(mktemp -d "$TOOLS_DIR/.dl.webp.XXXXXX")" || die "cannot create temp dir in $TOOLS_DIR"
+
+    log "$PROG: downloading cwebp/webpinfo from $url"
+    if ! download_verified "$url" "$sha" "$tmp/a.tgz"; then
+        rm -rf "$tmp"
+        die "download or checksum verification failed for $url"
+    fi
+    tar xzf "$tmp/a.tgz" -C "$tmp" || { rm -rf "$tmp"; die "failed to extract $pkg.tar.gz"; }
+    mv "$tmp/$pkg" "$TOOLS_DIR/$pkg" || { rm -rf "$tmp"; die "failed to install $pkg into $TOOLS_DIR"; }
+    rm -rf "$tmp"
+    log "$PROG: installed $pkg into $TOOLS_DIR"
+}
+
+bootstrap_exiftool() {
+    local tmp dir
+    tmp="$(mktemp -d "$TOOLS_DIR/.dl.exiftool.XXXXXX")" || die "cannot create temp dir in $TOOLS_DIR"
+
+    local url1="https://exiftool.org/Image-ExifTool-$EXIFTOOL_VERSION.tar.gz"
+    local url2="https://github.com/exiftool/exiftool/archive/refs/tags/$EXIFTOOL_VERSION.tar.gz"
+
+    log "$PROG: downloading exiftool $EXIFTOOL_VERSION"
+    if download_verified "$url1" "$EXIFTOOL_ORG_SHA" "$tmp/a.tgz"; then
+        :
+    elif download_verified "$url2" "$EXIFTOOL_GH_SHA" "$tmp/a.tgz"; then
+        :
+    else
+        rm -rf "$tmp"
+        die "could not download a checksum-verified exiftool from exiftool.org or GitHub; install exiftool via your package manager (e.g. apt install libimage-exiftool-perl, brew install exiftool)"
+    fi
+
+    tar xzf "$tmp/a.tgz" -C "$tmp" || { rm -rf "$tmp"; die "failed to extract exiftool archive"; }
+    dir="$(find "$tmp" -mindepth 1 -maxdepth 1 -type d | head -n 1)"
+    [ -f "$dir/exiftool" ] || { rm -rf "$tmp"; die "unexpected exiftool archive layout"; }
+    mv "$dir" "$TOOLS_DIR/exiftool" || { rm -rf "$tmp"; die "failed to install exiftool into $TOOLS_DIR"; }
+    rm -rf "$tmp"
+
+    # Self-relative wrapper so the tools/ dir stays relocatable.
+    local wtmp="$TOOLS_DIR/bin/.exiftool.tmp.$$"
+    mkdir -p "$TOOLS_DIR/bin" 2>/dev/null || die "cannot create $TOOLS_DIR/bin"
+    {
+        printf '%s\n' '#!/bin/sh'
+        printf '%s\n' 'd=$(CDPATH= cd "$(dirname "$0")" && pwd -P)'
+        printf '%s\n' 'exec perl "$d/../exiftool/exiftool" "$@"'
+    } > "$wtmp" || die "cannot write exiftool wrapper"
+    chmod +x "$wtmp"
+    mv "$wtmp" "$TOOLS_DIR/bin/exiftool"
+    log "$PROG: installed exiftool $EXIFTOOL_VERSION into $TOOLS_DIR"
+}
+
+# bootstrap_guarded <lock-name> <already-installed-path> <function>
+# Runs <function> under a mkdir lock, skipping if <path> already exists
+# (including when another concurrent process installs it while we wait).
+bootstrap_guarded() {
+    local key="$1" installed="$2" fn="$3"
+    local lock="$TOOLS_DIR/.lock-$key" i=0
+
+    [ -e "$installed" ] && return 0
+    mkdir -p "$TOOLS_DIR" 2>/dev/null || die "cannot create $TOOLS_DIR; set CPTW_TOOLS_DIR to a writable location"
+
+    # Clear a lock left behind by a crashed bootstrap (>10 min old).
+    if [ -d "$lock" ] && [ -n "$(find "$lock" -maxdepth 0 -mmin +10 2>/dev/null)" ]; then
+        rm -rf "$lock"
+    fi
+
+    while ! mkdir "$lock" 2>/dev/null; do
+        [ -e "$installed" ] && return 0   # another process finished it for us
+        i=$((i+1))
+        [ "$i" -gt 90 ] && die "timeout waiting for bootstrap lock $lock"
+        sleep 2
+    done
+
+    local rc=0
+    if [ ! -e "$installed" ]; then
+        "$fn" || rc=$?
+    fi
+    rm -rf "$lock"
+    [ "$rc" -eq 0 ] || die "bootstrap failed for $key"
+    return 0
+}
+
+# Resolve exiftool/cwebp/webpinfo, downloading them if necessary.
+# Mutates PATH (exported -> inherited by xargs workers).
+ensure_tools() {
+    local no_bootstrap="$1" plat
+
+    plat="$(platform_pkg_suffix 2>/dev/null || true)"
+
+    # cwebp (+ webpinfo, ships in the same package)
+    if ! command -v cwebp >/dev/null 2>&1; then
+        if [ -n "$plat" ] && [ -x "$TOOLS_DIR/libwebp-$WEBP_VERSION-$plat/bin/cwebp" ]; then
+            : # already vendored
+        elif [ "$no_bootstrap" = "1" ]; then
+            die "cwebp not found; install webp tools or run without --no-bootstrap"
+        else
+            bootstrap_guarded "webp-$plat" "$TOOLS_DIR/libwebp-$WEBP_VERSION-$plat/bin/cwebp" bootstrap_webp
+        fi
+        PATH="$TOOLS_DIR/libwebp-$WEBP_VERSION-$plat/bin:$PATH"
+        command -v cwebp >/dev/null 2>&1 || die "vendored cwebp failed to run"
+    fi
+
+    # exiftool (runs on system perl)
+    if ! command -v exiftool >/dev/null 2>&1; then
+        command -v perl >/dev/null 2>&1 || die "exiftool needs system perl, which was not found; install perl or exiftool via your package manager"
+        if [ -f "$TOOLS_DIR/exiftool/exiftool" ]; then
+            : # already vendored
+        elif [ "$no_bootstrap" = "1" ]; then
+            die "exiftool not found; install it or run without --no-bootstrap"
+        else
+            bootstrap_guarded "exiftool" "$TOOLS_DIR/exiftool/exiftool" bootstrap_exiftool
+        fi
+        PATH="$TOOLS_DIR/bin:$PATH"
+        command -v exiftool >/dev/null 2>&1 || die "vendored exiftool failed to run"
+    fi
+
+    export PATH
+}
+
+# ---------------------------------------------------------------------------
+# Worker mode: process one file. Invoked by the driver as:
+#   $0 --worker FILE
+# with configuration passed via CPTW_* environment variables.
+# ---------------------------------------------------------------------------
+worker() {
+    local src="$1"
+
+    local base="${src%.*}"
+    local webp="$base.webp"
+    local json="$base.json"
+
+    # Skip fully converted files (idempotent re-runs).
+    if [ -f "$webp" ] && [ -f "$json" ]; then
+        log "[SKIP] $src"
+        return 0
+    fi
+
+    local d="${src%/*}"
+    local tmp_webp="$d/.cptw.$$.tmp.webp"
+    local tmp_json="$d/.cptw.$$.tmp.json"
+
+    # Clean up temp files on interrupt so re-runs stay idempotent.
+    trap 'rm -f "$tmp_webp" "$tmp_json" 2>/dev/null' INT TERM
+
+    # 1. Extract workflow -> sidecar JSON (verbatim, as embedded).
+    #    Build it only if missing (a previous run may have made the webp).
+    if [ ! -f "$json" ]; then
+        if ! exiftool -b -PNG:Workflow -- "$src" > "$tmp_json" || [ ! -s "$tmp_json" ]; then
+            rm -f "$tmp_json"
+            err "[FAIL] $src: no workflow metadata found"
+            return 1
+        fi
+    fi
+
+    # 2. Encode -> webp, only if missing.
+    if [ ! -f "$webp" ]; then
+        if ! cwebp -quiet -q "$CPTW_QUALITY" -m "$CPTW_METHOD" "$src" -o "$tmp_webp"; then
+            rm -f "$tmp_webp" "$tmp_json"
+            err "[FAIL] $src: cwebp encoding failed"
+            return 1
+        fi
+
+        # 3. Verify the encoded file decodes.
+        if command -v webpinfo >/dev/null 2>&1; then
+            if ! webpinfo -summary "$tmp_webp" >/dev/null 2>&1; then
+                rm -f "$tmp_webp" "$tmp_json"
+                err "[FAIL] $src: produced webp failed verification"
+                return 1
+            fi
+        elif [ ! -s "$tmp_webp" ]; then
+            rm -f "$tmp_webp" "$tmp_json"
+            err "[FAIL] $src: produced webp is empty"
+            return 1
+        fi
+    fi
+
+    # Commit outputs.
+    [ -f "$tmp_webp" ] && mv -f "$tmp_webp" "$webp"
+    if [ -f "$tmp_json" ]; then
+        mv -f "$tmp_json" "$json"
+    fi
+
+    # 4. Remove the source PNG unless told to keep it.
+    if [ "$CPTW_KEEP" != "1" ]; then
+        if ! rm -f -- "$src"; then
+            err "[FAIL] $src: converted but could not delete source PNG"
+            return 1
+        fi
+    fi
+
+    log "[OK] $src"
+    return 0
+}
+
+detect_jobs() {
+    local n
+    n="$(getconf _NPROCESSORS_ONLN 2>/dev/null)" && [ -n "$n" ] && [ "$n" -ge 1 ] 2>/dev/null && { echo "$n"; return; }
+    n="$(nproc 2>/dev/null)" && [ -n "$n" ] && { echo "$n"; return; }
+    echo 4
+}
+
+# ---------------------------------------------------------------------------
+# Driver
+# ---------------------------------------------------------------------------
+main() {
+    local dir="."
+    local jobs=""
+    local keep=0
+    local quality=100
+    local method=6
+    local dry_run=0
+    local no_bootstrap=0
+
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            -h|--help)       usage; exit 0 ;;
+            -k|--keep)       keep=1 ;;
+            -n|--dry-run)    dry_run=1 ;;
+            --no-bootstrap)  no_bootstrap=1 ;;
+            -j|--jobs)       shift; jobs="${1:-}" ;;
+            -q|--quality)    shift; quality="${1:-}" ;;
+            -m|--method)     shift; method="${1:-}" ;;
+            --jobs=*)        jobs="${1#*=}" ;;
+            --quality=*)     quality="${1#*=}" ;;
+            --method=*)      method="${1#*=}" ;;
+            -*)              err "$PROG: unknown option: $1"; usage >&2; exit 2 ;;
+            *)               dir="$1" ;;
+        esac
+        shift
+    done
+
+    [ -d "$dir" ] || die "not a directory: $dir"
+    [ -n "$jobs" ] || jobs="$(detect_jobs)"
+
+    case "$jobs" in (*[!0-9]*|"") die "invalid --jobs: $jobs" ;; esac
+    case "$quality" in (*[!0-9]*|"") die "invalid --quality: $quality" ;; esac
+    case "$method" in (*[!0-9]*|"") die "invalid --method: $method" ;; esac
+
+    local total
+    total="$(find "$dir" -maxdepth 1 -type f -iname '*.png' -print0 | tr -cd '\0' | wc -c | tr -d ' ')"
+
+    if [ "$total" -eq 0 ]; then
+        log "$PROG: no PNG files found in $dir"
+        exit 0
+    fi
+
+    log "$PROG: $total PNG file(s) in $dir; jobs=$jobs quality=$quality method=$method keep=$keep dry_run=$dry_run"
+
+    if [ "$dry_run" = "1" ]; then
+        find "$dir" -maxdepth 1 -type f -iname '*.png' -print
+        exit 0
+    fi
+
+    ensure_tools "$no_bootstrap"
+
+    export CPTW_KEEP="$keep" CPTW_QUALITY="$quality" CPTW_METHOD="$method"
+
+    local self="$SCRIPT_DIR/$PROG"
+    local output rc
+    # Each worker invocation handles one file; capture output for the summary.
+    # Note: xargs aggregates worker exit codes coarsely, so per-file status is
+    # counted from the [OK]/[FAIL]/[SKIP] markers instead.
+    output="$(find "$dir" -maxdepth 1 -type f -iname '*.png' -print0 \
+        | xargs -0 -n 1 -P "$jobs" "$self" --worker 2>&1)"
+    rc=$?
+
+    printf '%s\n' "$output"
+
+    local ok fail skip
+    ok="$(printf '%s\n' "$output" | grep -c '^\[OK\]' || true)"
+    fail="$(printf '%s\n' "$output" | grep -c '^\[FAIL\]' || true)"
+    skip="$(printf '%s\n' "$output" | grep -c '^\[SKIP\]' || true)"
+
+    log "$PROG: done. ok=$ok skip=$skip fail=$fail (total=$total)"
+
+    if [ "$fail" -gt 0 ] || [ "$rc" -ne 0 ]; then
+        exit 1
+    fi
+    exit 0
+}
+
+# Internal worker entry point: $0 --worker FILE
+if [ "${1:-}" = "--worker" ]; then
+    shift
+    worker "$1"
+    exit $?
+fi
+
+main "$@"
